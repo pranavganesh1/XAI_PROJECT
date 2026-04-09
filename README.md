@@ -137,4 +137,7 @@ If you use parts of the code/data in this repository for your own research purpo
 
 ## 🚀 Author
 
-- Kushal Nayak
+- G Pranav Ganesh
+Kushal Nayak
+Kushal Kumar B
+Shravan Kumar
