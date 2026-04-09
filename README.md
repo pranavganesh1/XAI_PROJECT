@@ -135,9 +135,9 @@ If you use parts of the code/data in this repository for your own research purpo
 - Added evaluation and result interpretation
 - Cleaned and organized codebase
 
-## 🚀 Author
+## 🚀 Authors
 
 - G Pranav Ganesh
-Kushal Nayak
-Kushal Kumar B
-Shravan Kumar
+- Kushal Nayak
+- Kushal Kumar B
+- Shravan Kumar
