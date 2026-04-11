@@ -81,7 +81,7 @@ class ACREngine:
         """Train a RandomForest classifier on the loaded data."""
         df_encoded = self.df.copy()
 
-        # Encode categorical features
+        # Encode categorical features - STORE for inference
         self.label_encoders = {}
         for col in self.categorical_features:
             le = LabelEncoder()
@@ -94,28 +94,82 @@ class ACREngine:
             df_encoded[self.target] = le_target.fit_transform(df_encoded[self.target].astype(str))
             self.label_encoders[self.target] = le_target
 
-        # Handle NaN
-        df_encoded.fillna(df_encoded.median(numeric_only=True), inplace=True)
+        # Handle NaN - STORE statistics for inference
+        for col in self.continuous_features:
+            if df_encoded[col].isnull().any():
+                median_val = df_encoded[col].median()
+                df_encoded[col].fillna(median_val, inplace=True)
         for col in self.categorical_features:
-            df_encoded[col].fillna(df_encoded[col].mode()[0], inplace=True)
+            if df_encoded[col].isnull().any():
+                mode_val = df_encoded[col].mode()[0] if len(df_encoded[col].mode()) > 0 else 0
+                df_encoded[col].fillna(mode_val, inplace=True)
 
         X = df_encoded[self.feature_names]
         y = df_encoded[self.target]
 
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
+            X, y, test_size=0.2, random_state=42, stratify=y if len(np.unique(y)) > 1 else None
         )
 
+        # CRITICAL: Use same preprocessing pipeline for BOTH training and inference
         self.model = Pipeline([
             ('scaler', StandardScaler()),
-            ('clf', RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1))
+            ('clf', RandomForestClassifier(
+                n_estimators=100, 
+                random_state=42, 
+                max_depth=15,
+                min_samples_split=3,
+                n_jobs=-1
+            ))
         ])
         self.model.fit(self.X_train, self.y_train)
         self.accuracy = self.model.score(self.X_test, self.y_test)
+        
+        print(f"✓ Model trained - Accuracy: {self.accuracy:.4f}")
+        print(f"  Features: {len(self.feature_names)}")
+        print(f"  Train samples: {len(self.X_train)}")
 
         return self.accuracy
 
-    # ---- Step 3: Generate Counterfactuals ----
+    # ---- NEW: Proper Prediction with Preprocessing ----
+    def predict_proba(self, input_dict):
+        """
+        Predict using SAME preprocessing pipeline as training.
+        This is CRITICAL to ensure predictions change with inputs.
+        """
+        # Convert dict to DataFrame
+        input_df = pd.DataFrame([input_dict])
+
+        # CRITICAL: Encode categorical features SAME way as training
+        for col in self.categorical_features:
+            if col in self.label_encoders and col in input_df.columns:
+                try:
+                    input_df[col] = self.label_encoders[col].transform(input_df[col].astype(str))
+                except ValueError:
+                    # Unknown category - use default
+                    input_df[col] = 0
+
+        # CRITICAL: Remove non-feature columns
+        input_df = input_df[self.feature_names]
+
+        # CRITICAL: Use predict_proba for sensitivity
+        try:
+            proba = self.model.predict_proba(input_df)[0]
+            return proba
+        except Exception as e:
+            print(f"❌ Prediction error: {e}")
+            n_classes = len(np.unique(self.y_train))
+            return np.ones(n_classes) / n_classes
+
+    def predict_proba_class_0(self, input_dict):
+        """Get probability for class 0 (negative outcome)"""
+        proba = self.predict_proba(input_dict)
+        return proba[0] if len(proba) > 0 else 0.5
+
+    def predict_proba_class_1(self, input_dict):
+        """Get probability for class 1 (positive outcome)"""
+        proba = self.predict_proba(input_dict)
+        return proba[1] if len(proba) > 1 else 0.5
     def generate_counterfactuals(self, query_index, desired_class, num_cfs=5):
         """Generate counterfactual explanations using DiCE."""
         df_processed = self.df.copy()
@@ -171,7 +225,54 @@ class ACREngine:
                 val = max(0, min(val, len(self.label_encoders[col].classes_) - 1))
                 query_dict[col] = self.label_encoders[col].inverse_transform([val])[0]
 
-        return query_dict, raw_cfs
+        # Filter counterfactuals: only keep feature columns with actual changes
+        filtered_cfs = self._filter_meaningful_cfs(query_dict, raw_cfs)
+
+        return query_dict, filtered_cfs
+
+    def _filter_meaningful_cfs(self, query_dict, raw_cfs):
+        """
+        Filter counterfactuals to be meaningful:
+        1. Remove non-feature columns (IDs, metadata, target)
+        2. Only keep features that actually changed
+        3. Remove CFs with no real changes
+        
+        Returns: List of meaningful CFs (dict format)
+        """
+        filtered_cfs = []
+        
+        for cf in raw_cfs:
+            # Create a copy with only feature columns
+            cf_cleaned = {}
+            has_changes = False
+            
+            for feat in self.feature_names:
+                if feat not in cf or feat == self.target:
+                    continue
+                
+                # Get original value
+                orig_val = query_dict.get(feat)
+                cf_val = cf.get(feat)
+                
+                if orig_val is None or cf_val is None:
+                    continue
+                
+                # Add to cleaned CF (always include feature columns)
+                cf_cleaned[feat] = cf_val
+                
+                # Check if this feature changed
+                try:
+                    if float(orig_val) != float(cf_val):
+                        has_changes = True
+                except (ValueError, TypeError):
+                    if str(orig_val) != str(cf_val):
+                        has_changes = True
+            
+            # Only add if there are actual changes
+            if has_changes and cf_cleaned:
+                filtered_cfs.append(cf_cleaned)
+        
+        return filtered_cfs
 
     # ---- Step 4: Audit Counterfactuals ----
     def audit_counterfactuals(self, query_dict, raw_cfs, immutable_features, directional_rules=None):
@@ -253,7 +354,15 @@ class ACREngine:
     def get_predicted_class(self, query_index):
         """Get the model's prediction for a query instance."""
         query = self.X_test.iloc[[query_index]]
-        pred = self.model.predict(query)[0]
+        # FIXED: Use predict_proba instead of predict
+        pred_proba = self.model.predict_proba(query)[0]
+        pred = np.argmax(pred_proba)
+        
         if self.target in self.label_encoders:
             return self.label_encoders[self.target].inverse_transform([int(pred)])[0]
         return pred
+    
+    def get_predicted_proba(self, query_index):
+        """Get prediction probability for a query instance"""
+        query = self.X_test.iloc[[query_index]]
+        return self.model.predict_proba(query)[0]

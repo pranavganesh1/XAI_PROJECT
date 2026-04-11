@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Any, Optional
 from dataclasses import dataclass, asdict
+from .evaluation import evaluate_explanation, evaluate_batch_explanations
 
 
 @dataclass
@@ -98,38 +99,49 @@ class FaithfulnessEvaluator:
         improvement_deltas = []
         
         for cf_idx, cf in enumerate(counterfactuals):
-            # Evaluate actionability
-            actionability = self._evaluate_actionability(original_features, cf)
-            is_actionable = actionability['is_actionable']
-            feasibility_score = actionability['feasibility_score']
-            feasibility_scores.append(feasibility_score)
-            
-            if is_actionable:
-                actionable_count += 1
-            
-            # Evaluate prediction improvement
+            # Convert Series to dict for unified evaluation
+            cf_dict = cf.to_dict() if hasattr(cf, 'to_dict') else dict(cf)
+
+            # Get prediction for this counterfactual
             try:
                 cf_input = cf.values.reshape(1, -1) if len(cf.shape) == 1 else cf
                 cf_pred = model.predict_proba(cf_input)[0, desired_class]
             except Exception:
                 cf_pred = original_prediction
-            
-            # Ensure both are numeric floats
+
+            # Prepare input data for unified evaluation
+            input_data = original_features.to_dict() if hasattr(original_features, 'to_dict') else dict(original_features)
+            input_data['original_prediction'] = original_prediction
+
+            # Use unified evaluation (NEW SIGNATURE - pass original_prediction separately)
             original_pred_numeric = float(original_prediction) if isinstance(original_prediction, str) else original_prediction
             cf_pred_numeric = float(cf_pred) if isinstance(cf_pred, str) else cf_pred
             
+            evaluation_result = evaluate_explanation(cf_dict, cf_pred_numeric, input_data, original_pred_numeric, self.rules)
+
+            # Determine if faithful based on unified evaluation (now returns Dict)
+            is_faithful = evaluation_result.get("faithful", False)
+
+            # For backward compatibility, also compute actionability separately
+            actionability = self._evaluate_actionability(original_features, cf)
+            is_actionable = actionability['is_actionable']
+            feasibility_score = actionability['feasibility_score']
+
+            # Compute improvement delta
             improvement_delta = cf_pred_numeric - original_pred_numeric
-            improvement_deltas.append(improvement_delta)
-            
             improved = float(improvement_delta) > 0
+
             if improved:
                 improving_count += 1
-            
-            # Faithful = actionable AND improving
-            is_faithful = is_actionable and improved
+
+            # Count actionable (rule-compliant) CFs
+            if is_actionable:
+                actionable_count += 1
+
+            # Count faithful (rule-compliant AND improving) CFs
             if is_faithful:
                 faithful_count += 1
-            
+
             metrics_per_cf.append({
                 'cf_index': cf_idx,
                 'is_actionable': is_actionable,

@@ -4,6 +4,8 @@ based on semantic analysis of column names and data patterns.
 No manual selection needed.
 """
 
+from .evaluation import evaluate_explanation, evaluate_batch_explanations
+
 # Known immutable feature patterns across domains
 IMMUTABLE_PATTERNS = {
     # Demographics (cannot change)
@@ -18,7 +20,7 @@ IMMUTABLE_PATTERNS = {
     'birth': 'Birth-related features are immutable.',
     'dob': 'Date of birth is immutable.',
     'date_of_birth': 'Date of birth is immutable.',
-    
+
     # Genetics / Biology
     'pedigree': 'Genetic pedigree is immutable.',
     'diabetespedigreefunction': 'Genetic predisposition cannot be changed.',
@@ -26,7 +28,7 @@ IMMUTABLE_PATTERNS = {
     'dna': 'DNA-based features are immutable.',
     'hereditary': 'Hereditary features are immutable.',
     'family_history': 'Family history cannot be changed.',
-    
+
     # Historical / Past events
     'pregnancies': 'Past pregnancies cannot be undone.',
     'num_children': 'Number of existing children is historical.',
@@ -140,67 +142,53 @@ def auto_detect_rules(feature_names, df=None):
     return rules
 
 
-def apply_rules(query_dict, raw_cfs, rules):
+def apply_rules(query_dict, raw_cfs, rules, predictions=None):
     """
-    Filter counterfactuals using auto-detected rules.
-    
+    Filter counterfactuals using unified evaluation system.
+
+    Now uses the centralized evaluate_explanation() function to ensure
+    consistency with batch analysis.
+
+    Args:
+        query_dict: Original instance data (must include 'original_prediction')
+        raw_cfs: List of counterfactual dicts
+        rules: Domain rules dict
+        predictions: List of predictions for each counterfactual (optional)
+
     Returns:
-        valid_cfs: list of dicts (actionable suggestions)
+        valid_cfs: list of dicts (faithful suggestions)
         invalid_cfs: list of dicts with 'suggestion' and 'reason'
     """
     valid_cfs = []
     invalid_cfs = []
-    
-    for cf in raw_cfs:
-        is_valid = True
-        violation_reason = ""
-        
-        for feat, rule in rules.items():
-            if feat not in cf or feat not in query_dict:
-                continue
-            
-            original_val = query_dict[feat]
-            cf_val = cf[feat]
-            
-            # Skip if unchanged
-            try:
-                if float(original_val) == float(cf_val):
-                    continue
-            except (ValueError, TypeError):
-                if str(original_val) == str(cf_val):
-                    continue
-            
-            # Check immutability
-            if not rule['mutable']:
-                is_valid = False
-                violation_reason = f"🚫 '{feat}' is IMMUTABLE: {rule['reason']} (Suggested: {original_val} → {cf_val})"
-                break
-            
-            # Check directional constraints
-            if rule['constraint'] == 'increase_only':
-                try:
-                    if float(cf_val) < float(original_val):
-                        is_valid = False
-                        violation_reason = f"⬆️ '{feat}' can only INCREASE: {rule['reason']} (Suggested: {original_val} → {cf_val})"
-                        break
-                except (ValueError, TypeError):
-                    pass
-            
-            elif rule['constraint'] == 'decrease_only':
-                try:
-                    if float(cf_val) > float(original_val):
-                        is_valid = False
-                        violation_reason = f"⬇️ '{feat}' can only DECREASE: {rule['reason']} (Suggested: {original_val} → {cf_val})"
-                        break
-                except (ValueError, TypeError):
-                    pass
-        
-        if is_valid:
+
+    # Extract original prediction
+    original_pred = query_dict.get('original_prediction', 0.5)
+    try:
+        original_pred = float(original_pred)
+    except (ValueError, TypeError):
+        original_pred = 0.5
+
+    # If predictions not provided, assume all have same prediction as original
+    if predictions is None:
+        predictions = [original_pred] * len(raw_cfs)
+
+    if len(predictions) != len(raw_cfs):
+        raise ValueError("Predictions list must match counterfactuals list length")
+
+    for cf, prediction in zip(raw_cfs, predictions):
+        # Use unified evaluation (NEW SIGNATURE)
+        result = evaluate_explanation(cf, prediction, query_dict, original_pred, rules)
+
+        if result.get("faithful", False):
             valid_cfs.append(cf)
         else:
+            # Use the reason from evaluate_explanation
+            violation_reason = result.get("reason", "❌ Counterfactual violates faithfulness criteria")
+            
             invalid_cfs.append({
                 "suggestion": cf,
                 "reason": violation_reason
             })
-    
+
     return valid_cfs, invalid_cfs
