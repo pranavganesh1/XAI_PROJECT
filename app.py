@@ -12,12 +12,84 @@ import plotly.express as px
 import sys
 import os
 import json
+from sklearn.preprocessing import LabelEncoder
+from sklearn.impute import SimpleImputer
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from acr.engine import ACREngine
 from acr.smart_rules import auto_detect_rules, apply_rules
-from acr.narrator import get_narrative
+from acr.narrator import get_narrative, generate_explanation, evaluate_explanation
+from acr.faithfulness_metrics import create_evaluator
+
+# ---- AUTO-CLEANING FUNCTION ----
+def auto_clean_dataframe(df, clean_mode='auto'):
+    """Professor-approved auto-cleaning for messy CSVs"""
+    df_clean = df.copy()
+    
+    print(f"🔍 Original: {len(df)} rows, {len(df.columns)} cols")
+    
+    if clean_mode == 'raw':
+        print("⚠️ Using RAW data (no cleaning)")
+        return df_clean, {"status": "raw", "changes": {}}
+    
+    cleaning_log = {"status": "cleaned", "changes": {}}
+    
+    # 1. REMOVE DUPLICATES
+    initial_rows = len(df_clean)
+    df_clean = df_clean.drop_duplicates()
+    dup_removed = initial_rows - len(df_clean)
+    if dup_removed > 0:
+        print(f"🧹 Removed {dup_removed} duplicates")
+        cleaning_log["changes"]["duplicates_removed"] = dup_removed
+    
+    # 2. HANDLE MISSING VALUES
+    missing_before = df_clean.isnull().sum().sum()
+    for col in df_clean.columns:
+        if df_clean[col].dtype in ['object', 'string']:
+            mode_val = df_clean[col].mode()
+            if not mode_val.empty:
+                df_clean[col] = df_clean[col].fillna(mode_val[0])
+            else:
+                df_clean[col] = df_clean[col].fillna('unknown')
+        else:
+            df_clean[col] = df_clean[col].fillna(df_clean[col].median())
+    if missing_before > 0:
+        print(f"🧹 Filled {missing_before} missing values")
+        cleaning_log["changes"]["missing_filled"] = missing_before
+    
+    # 3. FIX DATA TYPES
+    for col in df_clean.columns:
+        if df_clean[col].dtype == 'object':
+            temp_col = pd.to_numeric(df_clean[col], errors='coerce')
+            if temp_col.notna().sum() / len(temp_col) > 0.8:
+                df_clean[col] = temp_col
+            else:
+                try:
+                    le = LabelEncoder()
+                    df_clean[col] = le.fit_transform(df_clean[col].astype(str))
+                except Exception as e:
+                    print(f"⚠️ Could not encode {col}: {e}")
+    
+    # 4. REMOVE OUTLIERS (IQR method)
+    for col in df_clean.select_dtypes(include=[np.number]).columns:
+        Q1 = df_clean[col].quantile(0.25)
+        Q3 = df_clean[col].quantile(0.75)
+        IQR = Q3 - Q1
+        if IQR > 0:
+            lower = Q1 - 1.5 * IQR
+            upper = Q3 + 1.5 * IQR
+            outlier_count = ((df_clean[col] < lower) | (df_clean[col] > upper)).sum()
+            df_clean = df_clean[(df_clean[col] >= lower) & (df_clean[col] <= upper)]
+            if outlier_count > 0:
+                print(f"🧹 Removed {outlier_count} outliers from {col}")
+                if "outliers_removed" not in cleaning_log["changes"]:
+                    cleaning_log["changes"]["outliers_removed"] = 0
+                cleaning_log["changes"]["outliers_removed"] += outlier_count
+    
+    print(f"✅ CLEANED: {len(df_clean)} rows, {len(df_clean.columns)} cols")
+    cleaning_log["changes"]["final_rows"] = len(df_clean)
+    return df_clean, cleaning_log
 
 # ---- Page Configuration ----
 st.set_page_config(
@@ -80,6 +152,9 @@ st.markdown("""
         font-weight: 700; font-size: 0.85rem; margin-right: 0.5rem;
     }
 
+    .faithful-row { background-color: #dcfce7 !important; }
+    .faithless-row { background-color: #fef2f2 !important; }
+
     .result-header {
         font-size: 1.3rem; font-weight: 600; color: #1f2937;
         margin: 1.5rem 0 1rem 0; padding-bottom: 0.5rem; border-bottom: 2px solid #667eea;
@@ -93,13 +168,42 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ---- Helper Functions ----
+def safe_dataframe_for_streamlit(df):
+    """
+    Convert dataframe to be safe for Streamlit display by ensuring all columns are strings.
+    This prevents PyArrow serialization errors with mixed data types.
+    """
+    if df is None or df.empty:
+        return df
+    
+    df_copy = df.copy()
+    
+    # Convert all columns to strings to avoid PyArrow issues
+    for col in df_copy.columns:
+        try:
+            # Handle different data types safely
+            if df_copy[col].dtype == 'object':
+                # For object columns, convert to string but handle None/NaN
+                df_copy[col] = df_copy[col].fillna('').astype(str)
+            else:
+                # For numeric/bool columns, convert to string representation
+                df_copy[col] = df_copy[col].astype(str)
+        except Exception:
+            # Fallback: force everything to string
+            df_copy[col] = df_copy[col].fillna('').astype(str)
+    
+    return df_copy
+
 # ---- Session State ----
 defaults = {
     'engine': ACREngine(), 'step': 1, 'model_trained': False,
     'cfs_generated': False, 'audit_done': False, 'query_dict': None,
     'raw_cfs': [], 'valid_cfs': [], 'invalid_cfs': [], 'auto_rules': {},
-    'narrative': None
+    'narrative': None, 'sample_choice': None, 'faithfulness_metrics': None,
+    'clean_mode': 'auto', 'cleaning_log': {}, 'dataset_name': 'uploaded dataset'
 }
+
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -121,6 +225,7 @@ with st.sidebar:
         ("Upload Dataset", st.session_state.step > 1),
         ("Train Model", st.session_state.model_trained),
         ("Generate & Auto-Audit", st.session_state.audit_done),
+        ("Batch Analysis", hasattr(st.session_state, 'batch_results') and st.session_state.get('batch_results')),
     ]
     for i, (label, done) in enumerate(steps, 1):
         status = "done" if done else ("active" if i == st.session_state.step else "")
@@ -134,6 +239,7 @@ with st.sidebar:
     2. **Train** a classifier on your data
     3. **Generate** counterfactual suggestions
     4. **Auto-Audit**: The system **automatically** detects which features are immutable (age, race, genetics) and filters impossible suggestions — **no manual setup needed!**
+    5. **Batch Analysis**: Run faithful/faithless classification on all instances
     """)
 
 
@@ -161,12 +267,29 @@ with col_upload:
             st.session_state.cfs_generated = False
             st.session_state.audit_done = False
 
+    # 🧹 AUTO-CLEAN TOGGLE
+    st.markdown("---")
+    st.markdown("**🧹 Data Cleaning Option:**")
+    col_toggle1, col_toggle2 = st.columns([1, 2])
+    with col_toggle1:
+        clean_checkbox = st.checkbox("Auto-clean data", value=True, key="clean_toggle")
+        st.session_state.clean_mode = 'auto' if clean_checkbox else 'raw'
+    with col_toggle2:
+        if clean_checkbox:
+            st.markdown("<span style='color: #22c55e; font-weight: bold;'>✅ Auto-clean: Removes duplicates, fills missing, fixes types & outliers</span>", unsafe_allow_html=True)
+        else:
+            st.markdown("<span style='color: #ef4444; font-weight: bold;'>❌ Raw data: Analyze as-is (no cleaning)</span>", unsafe_allow_html=True)
+
 engine = st.session_state.engine
 df = None
 
 if uploaded_file:
     try:
         df = engine.load_data(uploaded_file)
+        st.session_state.dataset_name = uploaded_file.name
+        # Apply auto-cleaning
+        df, cleaning_log = auto_clean_dataframe(df, st.session_state.clean_mode)
+        st.session_state.cleaning_log = cleaning_log
         st.session_state.step = max(st.session_state.step, 2)
     except Exception as e:
         st.error(f"Error: {e}")
@@ -174,6 +297,7 @@ elif hasattr(st.session_state, 'sample_choice') and st.session_state.sample_choi
     try:
         if st.session_state.sample_choice == 'diabetes':
             engine.df = pd.read_csv("https://raw.githubusercontent.com/plotly/datasets/master/diabetes.csv")
+            st.session_state.dataset_name = "Diabetes (Sample Dataset)"
         elif st.session_state.sample_choice == 'adult':
             cols = ['age','workclass','fnlwgt','education','education_num','marital_status',
                     'occupation','relationship','race','sex','capital_gain','capital_loss',
@@ -182,8 +306,12 @@ elif hasattr(st.session_state, 'sample_choice') and st.session_state.sample_choi
                 "https://raw.githubusercontent.com/jbrownlee/Datasets/master/adult-all.csv",
                 header=None, names=cols, skipinitialspace=True
             ).head(2000)
+            st.session_state.dataset_name = "Adult Income (Sample Dataset)"
         engine.df.columns = [c.strip().replace(' ', '_') for c in engine.df.columns]
         df = engine.df
+        # Apply auto-cleaning
+        df, cleaning_log = auto_clean_dataframe(df, st.session_state.clean_mode)
+        st.session_state.cleaning_log = cleaning_log
         st.session_state.step = max(st.session_state.step, 2)
     except Exception as e:
         st.error(f"Error loading sample: {e}")
@@ -191,7 +319,44 @@ elif hasattr(st.session_state, 'sample_choice') and st.session_state.sample_choi
 if df is not None:
     with col_preview:
         st.markdown(f"**Loaded:** `{df.shape[0]}` rows × `{df.shape[1]}` columns")
-        st.dataframe(df.head(8), use_container_width=True, height=280)
+        preview_df = df.head(8)
+        st.dataframe(safe_dataframe_for_streamlit(preview_df), use_container_width=True, height=280)
+
+    # 🧹 SHOW CLEANING STATUS
+    if st.session_state.cleaning_log.get("status") == "cleaned":
+        with st.expander("🧹 Data Cleaning Summary", expanded=False):
+            changes = st.session_state.cleaning_log.get("changes", {})
+            col_c1, col_c2 = st.columns(2)
+            with col_c1:
+                if "duplicates_removed" in changes:
+                    st.metric("🗑️ Duplicates Removed", changes["duplicates_removed"])
+                if "missing_filled" in changes:
+                    st.metric("📊 Missing Values Filled", changes["missing_filled"])
+            with col_c2:
+                if "outliers_removed" in changes:
+                    st.metric("📈 Outliers Removed", changes["outliers_removed"])
+                if "final_rows" in changes:
+                    st.metric("✅ Final Rows", changes["final_rows"])
+    elif st.session_state.cleaning_log.get("status") == "raw":
+        st.info("⚠️ Using RAW data (no cleaning applied)", icon="⚠️")
+
+    # 🧹 SHOW CLEANING STATUS
+    if st.session_state.cleaning_log.get("status") == "cleaned":
+        with st.expander("🧹 Data Cleaning Summary", expanded=False):
+            changes = st.session_state.cleaning_log.get("changes", {})
+            col_c1, col_c2 = st.columns(2)
+            with col_c1:
+                if "duplicates_removed" in changes:
+                    st.metric("🗑️ Duplicates Removed", changes["duplicates_removed"])
+                if "missing_filled" in changes:
+                    st.metric("📊 Missing Values Filled", changes["missing_filled"])
+            with col_c2:
+                if "outliers_removed" in changes:
+                    st.metric("📈 Outliers Removed", changes["outliers_removed"])
+                if "final_rows" in changes:
+                    st.metric("✅ Final Rows", changes["final_rows"])
+    elif st.session_state.cleaning_log.get("status") == "raw":
+        st.info("⚠️ Using RAW data (no cleaning applied)", icon="⚠️")
 
     m1, m2, m3, m4 = st.columns(4)
     with m1:
@@ -227,6 +392,37 @@ if df is not None:
                 st.session_state.audit_done = False
                 st.session_state.step = max(st.session_state.step, 3)
                 st.success(f"✅ Model trained! Accuracy: **{accuracy:.1%}**")
+                
+                # Display faithfulness metrics if available
+                if hasattr(st.session_state, 'faithfulness_metrics') and st.session_state.faithfulness_metrics:
+                    metrics = st.session_state.faithfulness_metrics
+                    st.markdown("---")
+                    st.markdown('<div class="result-header">📊 Faithfulness Metrics</div>', unsafe_allow_html=True)
+                    
+                    # Faithfulness metrics cards
+                    fm1, fm2, fm3 = st.columns(3)
+                    with fm1:
+                        faithful_rate = (metrics['num_faithful_cf'] / max(metrics['num_counterfactuals'], 1)) * 100
+                        st.markdown(f'<div class="metric-card"><h3 style="color:#22c55e">{faithful_rate:.1f}%</h3><p>✅ Faithful Rate<br><small>Actionable + Improving</small></p></div>', unsafe_allow_html=True)
+                    with fm2:
+                        rule_violation_rate = ((metrics['num_actionable_cf'] - metrics['num_faithful_cf']) / max(metrics['num_counterfactuals'], 1)) * 100
+                        st.markdown(f'<div class="metric-card"><h3 style="color:#ef4444">{rule_violation_rate:.1f}%</h3><p>❌ Rule Violations<br><small>Invalid Changes</small></p></div>', unsafe_allow_html=True)
+                    with fm3:
+                        agent_full_rate = 100.0 if metrics['has_feasible_recourse'] else 0.0
+                        st.markdown(f'<div class="metric-card"><h3 style="color:#f59e0b">{agent_full_rate:.1f}%</h3><p>🎯 Agent Full Rate<br><small>Feasible Recourse</small></p></div>', unsafe_allow_html=True)
+                    
+                    # Additional metrics
+                    st.markdown("**Detailed Metrics:**")
+                    detail_col1, detail_col2, detail_col3 = st.columns(3)
+                    with detail_col1:
+                        st.metric("Total Counterfactuals", metrics['num_counterfactuals'])
+                        st.metric("Actionable CFs", metrics['num_actionable_cf'])
+                    with detail_col2:
+                        st.metric("Faithful CFs", metrics['num_faithful_cf'])
+                        st.metric("Improving CFs", metrics['num_improving_cf'])
+                    with detail_col3:
+                        st.metric("Avg Feasibility", f"{metrics['avg_feasibility_score']:.2f}")
+                        st.metric("Max Improvement", f"{metrics['max_improvement_delta']:.3f}")
             except Exception as e:
                 st.error(f"Error: {e}")
                 import traceback
@@ -284,7 +480,8 @@ if df is not None:
             num_cfs = st.slider("Number of counterfactuals", 3, 10, 5)
 
         st.markdown("**Selected Instance:**")
-        st.dataframe(test_samples.iloc[[query_idx]], use_container_width=True)
+        instance_df = test_samples.iloc[[query_idx]]
+        st.dataframe(safe_dataframe_for_streamlit(instance_df), use_container_width=True)
 
         if st.button("⚡ Generate & Auto-Audit", type="primary", use_container_width=True):
             with st.spinner("Generating counterfactuals and running causal audit..."):
@@ -305,6 +502,24 @@ if df is not None:
                     st.session_state.audit_done = True
                     st.session_state.narrative = None  # Reset for fresh LLM call
 
+                    # Compute faithfulness metrics
+                    evaluator = create_evaluator(auto_rules)
+                    
+                    # Get original prediction probability (not class label)
+                    original_instance = engine.X_test.iloc[[query_idx]]
+                    original_pred_probs = engine.model.predict_proba(original_instance)[0]
+                    original_pred_prob = float(original_pred_probs[desired_enc])
+                    
+                    instance_metrics = evaluator.compute_instance_faithfulness(
+                        instance_id=query_idx,
+                        original_features=pd.Series(query_dict),
+                        counterfactuals=[pd.Series(cf) for cf in raw_cfs],
+                        original_prediction=original_pred_prob,
+                        model=engine.model,
+                        desired_class=desired_enc
+                    )
+                    st.session_state.faithfulness_metrics = instance_metrics
+
                     st.success(f"✅ Generated **{len(raw_cfs)}** suggestions → **{len(valid)}** Faithful, **{len(invalid)}** Faithless")
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -317,22 +532,40 @@ if df is not None:
     if st.session_state.audit_done:
         st.markdown("---")
 
-        # ---- LLM Narrative ----
-        st.markdown('<div class="result-header">🤖 AI-Generated Explanation (Gemini 2.5 Flash)</div>', unsafe_allow_html=True)
-        if not st.session_state.get('narrative'):
-            with st.spinner("🧠 Generating AI explanation..."):
-                try:
-                    narrative = get_narrative(
-                        st.session_state.query_dict,
-                        st.session_state.valid_cfs,
-                        st.session_state.invalid_cfs,
-                        engine.feature_names
-                    )
-                    st.session_state.narrative = narrative
-                except Exception as e:
-                    st.session_state.narrative = f"Could not generate AI narrative: {e}"
+        # ---- LLM Narrative (FRESH GENERATION PER INSTANCE) ----
+        st.markdown('<div class="result-header">🤖 AI-Generated Explanation (Instance-Specific)</div>', unsafe_allow_html=True)
         
-        st.info(st.session_state.narrative, icon="🤖")
+        # ALWAYS generate fresh narrative for each instance (no caching)
+        try:
+            with st.spinner("🧠 Generating personalized explanation..."):
+                # Get model prediction for context
+                model_pred = engine.model.predict_proba(engine.X_test.iloc[[query_idx]])[0]
+                pred_label = "Favorable" if model_pred.argmax() == 1 else "Unfavorable"
+                pred_prob = model_pred.max()
+                
+                narrative = generate_explanation(
+                    instance_id=query_idx,
+                    query_dict=st.session_state.query_dict,
+                    valid_cfs=st.session_state.valid_cfs,
+                    invalid_cfs=st.session_state.invalid_cfs,
+                    feature_names=engine.feature_names,
+                    model_pred=f"{pred_label} ({pred_prob:.1%})",
+                    dataset_name=st.session_state.get('dataset_name', 'uploaded dataset')
+                )
+                
+                # Evaluate explanation quality
+                is_valid_explanation, quality_score = evaluate_explanation(narrative, st.session_state.valid_cfs, st.session_state.invalid_cfs)
+                
+                if not is_valid_explanation:
+                    print(f"[DEBUG] WARNING: Low-quality explanation (score: {quality_score:.2f})")
+                    st.warning(f"⚠️ Explanation quality: {quality_score:.0%} (May be auto-generated due to API limits)")
+                
+        except Exception as e:
+            narrative = f"Could not generate explanation: {e}"
+            print(f"[DEBUG] Exception: {e}")
+            st.error(narrative)
+        
+        st.info(narrative, icon="🤖")
 
         st.markdown("---")
         st.markdown('<div class="result-header">📊 Audit Results — Faithful vs Faithless</div>', unsafe_allow_html=True)
@@ -372,11 +605,12 @@ if df is not None:
                             try:
                                 diff = float(new) - float(orig)
                                 direction = "📈" if diff > 0 else "📉"
-                                changes.append({"Feature": feat, "Original": orig, "Suggested": new, "Change": f"{direction} {diff:+.2f}"})
+                                changes.append({"Feature": feat, "Original": str(orig), "Suggested": str(new), "Change": f"{direction} {diff:+.2f}"})
                             except (ValueError, TypeError):
-                                changes.append({"Feature": feat, "Original": orig, "Suggested": new, "Change": "🔄 Changed"})
+                                changes.append({"Feature": feat, "Original": str(orig), "Suggested": str(new), "Change": "🔄 Changed"})
                     if changes:
-                        st.dataframe(pd.DataFrame(changes), use_container_width=True, hide_index=True)
+                        changes_df = pd.DataFrame(changes)
+                        st.dataframe(safe_dataframe_for_streamlit(changes_df), use_container_width=True, hide_index=True)
 
         # Invalid CFs
         if st.session_state.invalid_cfs:
@@ -420,6 +654,149 @@ if df is not None:
             "faithless_suggestions": st.session_state.invalid_cfs,
         }
         st.download_button("📥 Download Full Audit Report (JSON)", json.dumps(export, indent=4, default=str), "acr_audit_report.json", "application/json", use_container_width=True)
+
+# ═══════════════════════════════════════
+# BATCH ANALYSIS SECTION
+# ═══════════════════════════════════════
+
+# Run batch analysis on uploaded data
+if st.session_state.model_trained and df is not None:
+    st.markdown("---")
+    st.markdown("### 🚀 Run Batch Analysis on Your Data")
+
+    if st.button("🔍 Analyze All Instances (Batch)", type="secondary", use_container_width=True):
+        with st.spinner("Running batch analysis on all instances..."):
+            try:
+                # Get test samples (limit to reasonable number for demo)
+                test_samples = engine.get_test_samples(min(20, len(df)))
+                batch_results = []
+
+                # Progress bar
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                for i, instance_idx in enumerate(range(len(test_samples))):
+                    status_text.text(f"Analyzing instance {i+1}/{len(test_samples)}...")
+
+                    # Generate CFs for this instance
+                    desired_class = engine.get_target_classes()[0]  # Use first target class
+                    desired_enc = desired_class
+                    if engine.target in engine.label_encoders:
+                        desired_enc = engine.label_encoders[engine.target].transform([str(desired_class)])[0]
+
+                    query_dict, raw_cfs = engine.generate_counterfactuals(instance_idx, desired_enc, 5)
+
+                    # Apply rules
+                    
+                    valid, invalid = apply_rules(query_dict, raw_cfs, st.session_state.auto_rules)
+
+                    # Get original prediction probability (not class label)
+                    original_instance = engine.X_test.iloc[[instance_idx]]
+                    original_pred_probs = engine.model.predict_proba(original_instance)[0]
+                    original_pred_prob = float(original_pred_probs[desired_enc])
+
+                    # Compute metrics
+                    evaluator = create_evaluator(st.session_state.auto_rules)
+                    metrics = evaluator.compute_instance_faithfulness(
+                        instance_id=instance_idx,
+                        original_features=pd.Series(query_dict),
+                        counterfactuals=[pd.Series(cf) for cf in raw_cfs],
+                        original_prediction=original_pred_prob,
+                        model=engine.model,
+                        desired_class=desired_enc
+                    )
+
+                    batch_results.append(metrics)
+                    progress_bar.progress((i + 1) / len(test_samples))
+
+                progress_bar.empty()
+                status_text.empty()
+
+                # Display batch results
+                st.success(f"✅ Batch analysis completed for {len(batch_results)} instances!")
+
+                # Convert to DataFrame
+                batch_df = pd.DataFrame(batch_results)
+
+                # Overall batch metrics
+                batch_total_cfs = batch_df['num_counterfactuals'].sum()
+                batch_total_faithful = batch_df['num_faithful_cf'].sum()
+                batch_total_actionable = batch_df['num_actionable_cf'].sum()
+                batch_agent_full = batch_df['has_feasible_recourse'].sum()
+
+                batch_faithful_rate = (batch_total_faithful / max(batch_total_cfs, 1)) * 100
+                batch_violation_rate = ((batch_total_actionable - batch_total_faithful) / max(batch_total_cfs, 1)) * 100
+                batch_agent_rate = (batch_agent_full / max(len(batch_df), 1)) * 100
+
+                st.markdown("#### 📊 Your Dataset Batch Results")
+                br1, br2, br3 = st.columns(3)
+                with br1:
+                    st.markdown(f'<div class="metric-card"><h3 style="color:#22c55e">{batch_faithful_rate:.1f}%</h3><p>✅ Faithful Rate</p></div>', unsafe_allow_html=True)
+                with br2:
+                    st.markdown(f'<div class="metric-card"><h3 style="color:#ef4444">{batch_violation_rate:.1f}%</h3><p>❌ Rule Violations</p></div>', unsafe_allow_html=True)
+                with br3:
+                    st.markdown(f'<div class="metric-card"><h3 style="color:#f59e0b">{batch_agent_rate:.1f}%</h3><p>🎯 Agent Full Rate</p></div>', unsafe_allow_html=True)
+
+                # Show per-instance results
+                st.markdown("#### 📋 Per-Instance Results")
+                instance_results = []
+                for _, row in batch_df.iterrows():
+                    instance_id = int(row['instance_id'])
+                    num_faithful = int(row['num_faithful_cf'])
+                    num_cfs = int(row['num_counterfactuals'])
+                    has_recourse = row['has_feasible_recourse']
+
+                    if num_faithful > 0:
+                        status = "✅ FAITHFUL"
+                    else:
+                        status = "❌ FAITHLESS"
+
+                    instance_results.append({
+                        'Instance': f"#{instance_id}",
+                        'Status': status,
+                        'Faithful CFs': num_faithful,
+                        'Total CFs': num_cfs,
+                        'Agent-Full': "Yes" if has_recourse else "No"
+                    })
+
+                results_df = pd.DataFrame(instance_results)
+                st.dataframe(results_df, use_container_width=True, hide_index=True)
+
+                # Download batch results CSV
+                st.download_button(
+                    "📥 Download Batch Results (CSV)",
+                    batch_df.to_csv(index=False),
+                    "batch_faithfulness_results.csv",
+                    "text/csv",
+                    use_container_width=True
+                )
+
+                # Download total batch audit report JSON
+                batch_export = {
+                    "batch_summary": {
+                        "total_instances": len(batch_df),
+                        "total_counterfactuals": int(batch_total_cfs),
+                        "total_faithful_cf": int(batch_total_faithful),
+                        "total_actionable_cf": int(batch_total_actionable),
+                        "agent_full_instances": int(batch_agent_full),
+                        "faithful_rate": float(batch_faithful_rate),
+                        "rule_violation_rate": float(batch_violation_rate),
+                        "agent_full_rate": float(batch_agent_rate)
+                    },
+                    "instances": batch_df.to_dict(orient='records')
+                }
+                st.download_button(
+                    "📥 Download Total Batch Report (JSON)",
+                    json.dumps(batch_export, indent=4, default=str),
+                    "batch_total_report.json",
+                    "application/json",
+                    use_container_width=True
+                )
+
+            except Exception as e:
+                st.error(f"Batch analysis failed: {e}")
+                import traceback
+                st.code(traceback.format_exc())
 
 # Footer
 st.markdown("""

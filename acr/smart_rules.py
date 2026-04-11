@@ -54,6 +54,7 @@ DECREASE_ONLY_PATTERNS = {
 def auto_detect_rules(feature_names, df=None):
     """
     Automatically detect causal rules for each feature based on its name.
+    SAFE: Skips features not found in dataframe.
     
     Returns:
         rules: dict of {feature_name: {'mutable': bool, 'constraint': str|None, 'reason': str}}
@@ -61,6 +62,11 @@ def auto_detect_rules(feature_names, df=None):
     rules = {}
     
     for feat in feature_names:
+        # CRITICAL: Skip features that don't exist in the dataframe
+        if df is not None and feat not in df.columns:
+            print(f"[DEBUG] Skipping feature '{feat}' (not in dataframe columns)")
+            continue
+        
         feat_lower = feat.lower().strip().replace(' ', '_')
         
         # Check immutable patterns

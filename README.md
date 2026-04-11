@@ -84,6 +84,35 @@ To compute and plot the empirical expert success probability for each $\alpha$ u
 
 All experiments use the ImageNet16H-PS dataset collected from the human subject study, which are in ```study_data/```. We include a detailed description and the license of the dataset in ```study_data/README.md```.
 
+## **New Components Added**
+
+### **Flask API for CSV Analysis**
+Upload any CSV and get faithful/faithless metrics:
+
+```bash
+# Start the API
+python flask_app.py
+
+# API runs on http://localhost:5000
+# Upload endpoint: POST /analyze_csv
+# Dashboard: GET /dashboard
+```
+
+### **Streamlit Dashboard** 
+Interactive counterfactual generation:
+
+```bash
+python -m streamlit run app.py
+# Opens at http://localhost:8502
+```
+
+### **Enhanced JMLR Experiments**
+Fixed import issues and improved error handling:
+
+```bash
+python scripts/jmlr_acr_experiments.py
+```
+
 
 ## **Running Sensitivity Analysis** 
 
@@ -134,6 +163,9 @@ If you use parts of the code/data in this repository for your own research purpo
 - Updated README with proper documentation
 - Added evaluation and result interpretation
 - Cleaned and organized codebase
+- **Fixed Streamlit PyArrow serialization errors** - Added comprehensive dataframe type safety for all displays
+- **Added Flask API** for CSV upload and faithful/faithless analysis (`flask_app.py`)
+- **Enhanced JMLR experiments** with better error handling and fallback imports
 
 ## 🚀 Author
 
