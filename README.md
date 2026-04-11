@@ -167,6 +167,9 @@ If you use parts of the code/data in this repository for your own research purpo
 - **Added Flask API** for CSV upload and faithful/faithless analysis (`flask_app.py`)
 - **Enhanced JMLR experiments** with better error handling and fallback imports
 
-## 🚀 Author
+## 🚀 Authors
 
+- G Pranav Ganesh
 - Kushal Nayak
+- Kushal Kumar B
+- Shravan Kumar
